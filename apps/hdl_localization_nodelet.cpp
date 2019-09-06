@@ -341,7 +341,6 @@ private:
   ros::NodeHandle private_nh;
 
   bool use_imu;
-  bool use_external_odom;
   bool invert_imu;
   ros::Subscriber imu_sub;
   ros::Subscriber points_sub;
