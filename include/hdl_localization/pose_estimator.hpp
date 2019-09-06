@@ -88,29 +88,35 @@ public:
    * @param cloud   input cloud
    * @return cloud aligned to the globalmap
    */
-  pcl::PointCloud<PointT>::Ptr correct(const pcl::PointCloud<PointT>::ConstPtr& cloud) {
+  bool correct(const pcl::PointCloud<PointT>::ConstPtr& cloud, pcl::PointCloud<PointT>::Ptr aligned,
+      std::function<bool(pcl::Registration<PointT, PointT>::Ptr)> correct_if = {}) {
     Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
     init_guess.block<3, 3>(0, 0) = quat().toRotationMatrix();
     init_guess.block<3, 1>(0, 3) = pos();
 
-    pcl::PointCloud<PointT>::Ptr aligned(new pcl::PointCloud<PointT>());
+    aligned.reset(new pcl::PointCloud<PointT>());
     registration->setInputSource(cloud);
     registration->align(*aligned, init_guess);
 
-    Eigen::Matrix4f trans = registration->getFinalTransformation();
-    Eigen::Vector3f p = trans.block<3, 1>(0, 3);
-    Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
+    bool b_corrected = false;
+    if (!correct_if /* if no function was set, always correct */ 
+        || correct_if(registration)) {
+      b_corrected = true;
+      Eigen::Matrix4f trans = registration->getFinalTransformation();
+      Eigen::Vector3f p = trans.block<3, 1>(0, 3);
+      Eigen::Quaternionf q(trans.block<3, 3>(0, 0));
 
-    if(quat().coeffs().dot(q.coeffs()) < 0.0f) {
-      q.coeffs() *= -1.0f;
+      if(quat().coeffs().dot(q.coeffs()) < 0.0f) {
+        q.coeffs() *= -1.0f;
+      }
+
+      Eigen::VectorXf observation(7);
+      observation.middleRows(0, 3) = p;
+      observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
+
+      ukf->correct(observation);
     }
-
-    Eigen::VectorXf observation(7);
-    observation.middleRows(0, 3) = p;
-    observation.middleRows(3, 4) = Eigen::Vector4f(q.w(), q.x(), q.y(), q.z());
-
-    ukf->correct(observation);
-    return aligned;
+    return b_corrected;
   }
 
   /* getters */

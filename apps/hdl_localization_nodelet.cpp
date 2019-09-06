@@ -2,12 +2,20 @@
 #include <memory>
 #include <iostream>
 #include <boost/circular_buffer.hpp>
+#include <boost/format.hpp>
 
 #include <ros/ros.h>
 #include <pcl_ros/point_cloud.h>
 #include <tf_conversions/tf_eigen.h>
 #include <tf/transform_broadcaster.h>
-
+#include <diagnostic_updater/diagnostic_updater.h>
+#include <diagnostic_updater/publisher.h>
+#include <diagnostic_msgs/DiagnosticStatus.h>
+// ERROR defined in windows.h causes name collision, undefine the macro to fix the issue
+#ifdef ERROR
+#undef ERROR
+#endif
+ 
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -40,6 +48,9 @@ public:
     mt_nh = getMTNodeHandle();
     private_nh = getPrivateNodeHandle();
 
+    updater.setHardwareID("none");
+    updater.add("HdlLocalization status updater", this, &HdlLocalizationNodelet::update_diagnostics);
+
     processing_time.resize(16);
     initialize_params();
 
@@ -49,6 +60,8 @@ public:
       NODELET_INFO("enable imu-based prediction");
       imu_sub = mt_nh.subscribe("/gpsimu_driver/imu_data", 256, &HdlLocalizationNodelet::imu_callback, this);
     }
+    score_change_threshold = private_nh.param<double>("score_change_threshold", score_change_threshold);
+    correction_skipped_count_threshold = private_nh.param<double>("correction_skipped_count_threshold", correction_skipped_count_threshold);
     points_sub = mt_nh.subscribe("/velodyne_points", 5, &HdlLocalizationNodelet::points_callback, this);
     globalmap_sub = nh.subscribe("/globalmap", 1, &HdlLocalizationNodelet::globalmap_callback, this);
     initialpose_sub = nh.subscribe("/initialpose", 8, &HdlLocalizationNodelet::initialpose_callback, this);
@@ -157,8 +170,29 @@ private:
 
     // correct
     auto t1 = ros::WallTime::now();
-    auto aligned = pose_estimator->correct(filtered);
+    double score;
+    pcl::PointCloud<PointT>::Ptr aligned;
+    bool b_corrected = pose_estimator->correct(filtered, aligned, [&](pcl::Registration<PointT, PointT>::Ptr registration){ 
+            score = registration->getFitnessScore();
+            if (this->b_initial_correction) {
+                this->b_initial_correction = false;
+                return true;
+            }
+            b_converged = registration->hasConverged();
+            if (b_converged) {
+                double score_diff = std::abs(score - this->last_score);
+                if (score_diff < this->score_change_threshold) {
+                    correction_skipped_count = 0;
+                    return true;
+                }
+                NODELET_WARN("score difference is %f, larger than %f", score_diff, this->score_change_threshold);
+                return false;
+            }
+            this->correction_skipped_count++;
+            return false;
+            });
     auto t2 = ros::WallTime::now();
+    last_score = score;
 
     processing_time.push_back((t2 - t1).toSec());
     double avg_processing_time = std::accumulate(processing_time.begin(), processing_time.end(), 0.0) / processing_time.size();
@@ -171,6 +205,8 @@ private:
     }
 
     publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
+
+    updater.update();
   }
 
   /**
@@ -281,6 +317,23 @@ private:
     return odom_trans;
   }
 
+  void update_diagnostics(diagnostic_updater::DiagnosticStatusWrapper &stat) {
+    std::string msg = (boost::format("correction skipped for %d") % correction_skipped_count).str();
+    if (correction_skipped_count > correction_skipped_count_threshold) {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::ERROR, msg.c_str());
+    } else {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::OK, msg.c_str());
+    }
+
+    if (b_converged) {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::OK, "NDT Succeeded");
+    } else {
+      stat.summary(diagnostic_msgs::DiagnosticStatus::ERROR, "NDT Failed");
+    }
+    stat.add("Correction Skipped Count", correction_skipped_count);
+    stat.add("NDT Convergence", b_converged);
+  }
+
 private:
   // ROS
   ros::NodeHandle nh;
@@ -288,6 +341,7 @@ private:
   ros::NodeHandle private_nh;
 
   bool use_imu;
+  bool use_external_odom;
   bool invert_imu;
   ros::Subscriber imu_sub;
   ros::Subscriber points_sub;
@@ -296,7 +350,10 @@ private:
 
   ros::Publisher pose_pub;
   ros::Publisher aligned_pub;
+  ros::Publisher status_pub;
   tf::TransformBroadcaster pose_broadcaster;
+
+  diagnostic_updater::Updater updater;
 
   // imu input buffer
   std::mutex imu_data_mutex;
@@ -313,6 +370,13 @@ private:
 
   // processing time buffer
   boost::circular_buffer<double> processing_time;
+
+  bool b_initial_correction = true;
+  bool b_converged = false;
+  double score_change_threshold = 14.0;
+  int correction_skipped_count_threshold = 10;
+  int correction_skipped_count = 0;
+  double last_score = 0.0;
 };
 
 }
